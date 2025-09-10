@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NFL 2025 Matchup Predictor</title>
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.development.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/localforage@1/dist/localforage.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useEffect, useMemo, useState, useRef } = React;
+
+    // --- Helper: fetch CSV robustly with Papa ---
+    async function fetchCsv(url) {
+      const cacheKey = `csv_${url}`;
+      const cached = await localforage.getItem(cacheKey);
+      if (cached) return cached;
+
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) {
+        throw new Error(`Failed to fetch ${url} — ${res.status} ${res.statusText}`);
+      }
+      const text = await res.text();
+      const parsed = Papa.parse(text, { header: true, dynamicTyping: true, skipEmptyLines: true });
+      if (parsed.errors?.length) {
+        console.warn("CSV parse warnings:", parsed.errors.slice(0, 3));
+      }
+      validateCsv(parsed.data, ["team", "week", "season"]);
+      await localforage.setItem(cacheKey, parsed.data);
+      return parsed.data;
+    }
+
+    // --- Validate CSV schema ---
+    function validateCsv(data, requiredFields) {
+      const firstRow = data[0] || {};
+      const missing = requiredFields.filter(f => !(f in firstRow));
+      if (missing.length) {
+        throw new Error(`CSV missing required fields: ${missing.join(", ")}`);
+      }
+    }
+
+    // --- Heuristic pickers for differing column names ---
+    const pick = (row, candidates, fallback = undefined) => {
+      for (const c of candidates) if (row[c] !== undefined && row[c] !== null) return row[c];
+      return fallback;
+    };
+
+    // Normalize team abbreviations
+    const TEAM_ALIASES = {
+      LA: "LAR", SD: "LAC", OAK: "LV", ARI: "ARI", JAX: "JAC", CLV: "CLE", CRD: "ARI",
+    };
+    const normTeam = (t) => (t ? TEAM_ALIASES[t.toUpperCase()] ?? t.toUpperCase() : "");
+
+    // --- Core model: simple rating from rolling performance with exponential weighting ---
+    function makeTeamRatings(teamWeeks, { lookback = 4, metricWeights, reg = 0.25, decay = 0.9 }) {
+      const ratings = {};
+      const byTeam = teamWeeks;
+      const keys = Object.keys(byTeam);
+      const leagueAvg = (data, fieldList) => {
+        const vals = data.map(r => pick(r, fieldList)).filter(v => isFinite(v));
+        return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+      };
+
+      const leagueAvgs = {
+        off_ppg: leagueAvg(teamWeeks.flatMap(t => t), ["points", "points_for", "pf", "points_scored"]),
+        def_ppg: leagueAvg(teamWeeks.flatMap(t => t), ["points_allowed", "points_against", "pa"]),
+        off_ypp: leagueAvg(teamWeeks.flatMap(t => t), ["yards_per_play_offense", "off_ypp", "off_yards_per_play"]),
+        def_ypp: leagueAvg(teamWeeks.flatMap(t => t), ["yards_per_play_defense", "def_ypp", "def_yards_per_play"]),
+        off_epa: leagueAvg(teamWeeks.flatMap(t => t), ["off_epa_per_play", "off_epa"]),
+        def_epa: leagueAvg(teamWeeks.flatMap(t => t), ["def_epa_per_play", "def_epa"]),
+        off_sr: leagueAvg(teamWeeks.flatMap(t => t), ["success_rate_offense", "off_success_rate"]),
+        def_sr: leagueAvg(teamWeeks.flatMap(t => t), ["success_rate_defense", "def_success_rate"]),
+      };
+
+      for (const team of keys) {
+        const games = byTeam[team] || [];
+        ratings[team] = {};
+        for (let i = 0; i < games.length; i++) {
+          const wk = games[i].week;
+          const hist = games.filter(g => g.week < wk).slice(-lookback);
+          const agg = (arr, fieldList, transform = (x) => x) => {
+            if (!arr.length) {
+              const key = fieldList[0].split("_")[0] + "_" + fieldList[0].split("_")[1];
+              return leagueAvgs[key] || 0;
+            }
+            const look = arr.length;
+            const weights = arr.map((_, idx) => Math.pow(decay, look - 1 - idx));
+            const sumW = weights.reduce((a, b) => a + b, 0);
+            let sumV = 0;
+            for (let j = 0; j < arr.length; j++) {
+              const val = pick(arr[j], fieldList);
+              if (isFinite(val)) {
+                sumV += weights[j] * transform(val);
+              } else {
+                // For missing, use league avg weighted
+                const key = fieldList[0].split("_")[0] + "_" + fieldList[0].split("_")[1];
+                sumV += weights[j] * (leagueAvgs[key] || 0);
+              }
+            }
+            return sumV / sumW;
+          };
+
+          const off_ppg = agg(hist, ["points", "points_for", "pf", "points_scored"]);
+          const def_ppg_allowed = agg(hist, ["points_allowed", "points_against", "pa"]);
+          const ypp_off = agg(hist, ["yards_per_play_offense", "off_ypp", "off_yards_per_play"]);
+          const ypp_def = agg(hist, ["yards_per_play_defense", "def_ypp", "def_yards_per_play"]);
+          const epa_off = agg(hist, ["off_epa_per_play", "off_epa"]);
+          const epa_def = agg(hist, ["def_epa_per_play", "def_epa"]);
+          const succ_off = agg(hist, ["success_rate_offense", "off_success_rate"]);
+          const succ_def = agg(hist, ["success_rate_defense", "def_success_rate"]);
+
+          const w = metricWeights;
+          const off =
+            (w.off_ppg && off_ppg ? w.off_ppg * off_ppg : 0) +
+            (w.off_ypp && ypp_off ? w.off_ypp * ypp_off : 0) +
+            (w.off_epa && epa_off ? w.off_epa * epa_off : 0) +
+            (w.off_sr && succ_off ? w.off_sr * succ_off : 0);
+          const def =
+            (w.def_ppg && def_ppg_allowed ? w.def_ppg * (-def_ppg_allowed) : 0) +
+            (w.def_ypp && ypp_def ? w.def_ypp * (-ypp_def) : 0) +
+            (w.def_epa && epa_def ? w.def_epa * (-epa_def) : 0) +
+            (w.def_sr && succ_def ? w.def_sr * (-succ_def) : 0);
+
+          const strength = (off + def) / Math.max(1, Object.values(w).filter(Boolean).length) || 0;
+          ratings[team][wk] = (1 - reg) * strength + reg * 0; // Regress to 0 (neutral)
+        }
+      }
+      return ratings;
+    }
+
+    function logistic(x) { return 1 / (1 + Math.exp(-x)); }
+
+    function App() {
+      const [week, setWeek] = useState(1);
+      const [lookback, setLookback] = useState(4);
+      const [hfa, setHfa] = useState(1.5);
+      const [scale, setScale] = useState(0.25);
+      const [reg, setReg] = useState(0.25);
+      const [decay, setDecay] = useState(0.9);
+      const [spreadScale, setSpreadScale] = useState(2);
+      const [metricWeights, setMetricWeights] = useState({
+        off_ppg: 1, off_ypp: 0.5, off_epa: 2, off_sr: 1,
+        def_ppg: 1, def_ypp: 0.5, def_epa: 2, def_sr: 1,
+      });
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState("");
+      const [games, setGames] = useState([]);
+      const [preds, setPreds] = useState([]);
+      const [rawTeamWeeks, setRawTeamWeeks] = useState([]);
+      const [useNeutral, setUseNeutral] = useState(false);
+      const chartRef = useRef(null);
+      let chartInstance = useRef(null);
+
+      const scheduleUrl = "https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv";
+      const teamWeekUrl2025 = "https://github.com/nflverse/nflverse-data/releases/download/stats_team/stats_team_week_2025.csv";
+      const teamWeekUrl2024 = "https://github.com/nflverse/nflverse-data/releases/download/stats_team/stats_team_week_2024.csv";
+
+      async function loadData() {
+        try {
+          setLoading(true);
+          setError("");
+          let sched = await fetchCsv(scheduleUrl);
+          let teamWeeks = [];
+
+          // Try 2025 data first, fall back to 2024 if needed
+          try {
+            teamWeeks = await fetchCsv(teamWeekUrl2025);
+          } catch (e) {
+            console.warn("Failed to fetch 2025 data, trying 2024:", e);
+            teamWeeks = await fetchCsv(teamWeekUrl2024);
+          }
+
+          // Filter schedule to 2025 season and selected week
+          const weekGames = sched.filter(r => {
+            const gs = pick(r, ["season", "gameday_season"]);
+            const w = pick(r, ["week", "game_week", "gameday_week"]);
+            const seasonMatch = Number(gs) === 2025;
+            const weekMatch = Number(w) === Number(week);
+            const hasTeams = !!pick(r, ["home_team", "home_team_abbr", "home"]) && !!pick(r, ["away_team", "away_team_abbr", "away"]);
+            return seasonMatch && weekMatch && hasTeams;
+          }).map(r => ({
+            game_id: pick(r, ["game_id", "gameday_id"]) ?? `2025_${pick(r, ["game_day", "gameday"])}`,
+            home: normTeam(pick(r, ["home_team", "home_team_abbr", "home"]).toUpperCase()),
+            away: normTeam(pick(r, ["away_team", "away_team_abbr", "away"]).toUpperCase()),
+            neutral: !!pick(r, ["neutral", "neutral_site"], false),
+            date: pick(r, ["gamedate", "game_date"]),
+            venue: pick(r, ["stadium", "venue"]),
+          }));
+
+          // Group team weekly stats by team
+          const teamWeeksClean = teamWeeks.map(row => {
+            const t = normTeam(String(pick(row, ["team", "recent_team", "team_abbr"])));
+            const w = Number(pick(row, ["week", "game_week"])) || undefined;
+            const s = Number(pick(row, ["season", "year"])) || undefined;
+            return { ...row, team: t, week: w, season: s };
+          }).filter(r => (r.season === 2025 || r.season === 2024) && Number.isFinite(r.week));
+
+          const byTeam = {};
+          for (const r of teamWeeksClean) {
+            byTeam[r.team] ||= [];
+            byTeam[r.team].push(r);
+          }
+          for (const t of Object.keys(byTeam)) byTeam[t].sort((a, b) => a.week - b.week);
+
+          // Build ratings up to each week
+          const ratings = makeTeamRatings(byTeam, { lookback, metricWeights, reg, decay });
+
+          // Predict each matchup
+          const k = scale;
+          const h = useNeutral ? 0 : hfa;
+          const predictions = weekGames.map(g => {
+            const rw = week;
+            const rHome = ratings[g.home]?.[rw] ?? 0;
+            const rAway = ratings[g.away]?.[rw] ?? 0;
+            const edge = (rHome - rAway) + (g.neutral ? 0 : h);
+            const pointSpread = edge * spreadScale;
+            return {
+              ...g,
+              home_rating: rHome,
+              away_rating: rAway,
+              edge,
+              home_win_prob: logistic(k * edge),
+              point_spread: pointSpread.toFixed(1),
+            };
+          }).sort((a, b) => b.home_win_prob - a.home_win_prob);
+
+          setGames(weekGames);
+          setRawTeamWeeks(teamWeeksClean);
+          setPreds(predictions);
+        } catch (e) {
+          console.error(e);
+          setError(String(e.message || e));
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      // Chart effect
+      useEffect(() => {
+        if (preds.length && chartRef.current) {
+          const ctx = chartRef.current.getContext("2d");
+          if (chartInstance.current) {
+            chartInstance.current.destroy();
+          }
+          chartInstance.current = new Chart(ctx, {
+            type: "bar",
+            data: {
+              labels: preds.map(p => `${p.away} @ ${p.home}`),
+              datasets: [{
+                label: "Home Win Probability (%)",
+                data: preds.map(p => (p.home_win_prob * 100)),
+                backgroundColor: "#4CAF50",
+                borderColor: "#388E3C",
+                borderWidth: 1
+              }]
+            },
+            options: {
+              responsive: true,
+              scales: {
+                y: { beginAtZero: true, max: 100, title: { display: true, text: "Win Probability (%)" } },
+                x: { title: { display: true, text: "Game" } }
+              },
+              plugins: { legend: { display: false } }
+            }
+          });
+        }
+        return () => {
+          if (chartInstance.current) {
+            chartInstance.current.destroy();
+          }
+        };
+      }, [preds]);
+
+      // Export predictions as CSV
+      function exportPreds() {
+        const csv = Papa.unparse(preds.map(p => ({
+          game_id: p.game_id,
+          home: p.home,
+          away: p.away,
+          home_win_prob: (p.home_win_prob * 100).toFixed(1) + "%",
+          point_spread: p.point_spread,
+          home_rating: p.home_rating?.toFixed(2),
+          away_rating: p.away_rating?.toFixed(2),
+        })));
+        const blob = new Blob([csv], { type: "text/csv" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `nfl_predictions_2025_week_${week}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+
+      useEffect(() => {
+        loadData();
+      }, [week, lookback, hfa, scale, reg, decay, spreadScale, metricWeights, useNeutral]);
+
+      return (
+        <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white text-slate-900 p-4 sm:p-8">
+          <div className="max-w-6xl mx-auto">
+            <header className="flex items-center justify-between gap-4 mb-6">
+              <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">
+                NFL 2025 Matchup Predictor
+              </h1>
+              <div className="text-xs sm:text-sm text-slate-500">Powered by nflverse data</div>
+            </header>
+
+            <div className="mb-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-3">
+                <div className="grid grid-cols-3 items-center gap-2">
+                  <label className="col-span-1 font-medium">Week</label>
+                  <input
+                    type="number"
+                    className="col-span-2 border rounded px-2 py-1"
+                    value={week}
+                    min={1}
+                    max={22}
+                    onChange={(e) => setWeek(Math.min(22, Math.max(1, Number(e.target.value) || 1)))}
+                  />
+                </div>
+                <div className="grid grid-cols-3 items-center gap-2">
+                  <label className="col-span-2 font-medium">Neutral sites</label>
+                  <div className="col-span-1 flex items-center justify-end">
+                    <input
+                      type="checkbox"
+                      checked={useNeutral}
+                      onChange={(e) => setUseNeutral(e.target.checked)}
+                    />
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 items-center gap-2">
+                  <label className="font-medium">Lookback (games)</label>
+                  <div className="col-span-2 px-2">
+                    <input
+                      type="range"
+                      min={1}
+                      max={8}
+                      step={1}
+                      value={lookback}
+                      onChange={(e) => setLookback(Number(e.target.value))}
+                      className="w-full"
+                    />
+                    <div className="text-sm text-slate-500">{lookback} games</div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 items-center gap-2">
+                  <label className="font-medium">Home field (+)</label>
+                  <div className="col-span-2 px-2">
+                    <input
+                      type="range"
+                      min={0}
+                      max={4}
+                      step={0.1}
+                      value={hfa}
+                      onChange={(e) => setHfa(Number(e.target.value))}
+                      className="w-full"
+                    />
+                    <div className="text-sm text-slate-500">{hfa.toFixed(1)} rating units</div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 items-center gap-2">
+                  <label className="font-medium">Win-prob slope</label>
+                  <div className="col-span-2 px-2">
+                    <input
+                      type="range"
+                      min={0.05}
+                      max={1}
+                      step={0.05}
+                      value={scale}
+                      onChange={(e) => setScale(Number(e.target.value))}
+                      className="w-full"
+                    />
+                    <div className="text-sm text-slate-500">{scale.toFixed(2)}</div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 items-center gap-2">
+                  <label className="font-medium">Regression to mean</label>
+                  <div className="col-span-2 px-2">
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={reg}
+                      onChange={(e) => setReg(Number(e.target.value))}
+                      className="w-full"
+                    />
+                    <div className="text-sm text-slate-500">{reg.toFixed(2)}</div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 items-center gap-2">
+                  <label className="font-medium">Recent decay</label>
+                  <div className="col-span-2 px-2">
+                    <input
+                      type="range"
+                      min={0.5}
+                      max={1}
+                      step={0.05}
+                      value={decay}
+                      onChange={(e) => setDecay(Number(e.target.value))}
+                      className="w-full"
+                    />
+                    <div className="text-sm text-slate-500">{decay.toFixed(2)} (higher = even weight)</div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 items-center gap-2">
+                  <label className="font-medium">Points/rating unit</label>
+                  <div className="col-span-2 px-2">
+                    <input
+                      type="range"
+                      min={1}
+                      max={5}
+                      step={0.1}
+                      value={spreadScale}
+                      onChange={(e) => setSpreadScale(Number(e.target.value))}
+                      className="w-full"
+                    />
+                    <div className="text-sm text-slate-500">{spreadScale.toFixed(1)}</div>
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={loadData}
+                    disabled={loading}
+                    className="bg-blue-600 text-white px-4 py-2 rounded flex items-center gap-2 disabled:opacity-50"
+                  >
+                    {loading ? "Loading..." : "Refresh & Predict"}
+                  </button>
+                  <button
+                    onClick={exportPreds}
+                    disabled={loading || !preds.length}
+                    className="bg-green-600 text-white px-4 py-2 rounded disabled:opacity-50"
+                  >
+                    Export Predictions
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                <div className="text-sm font-medium">Metric Weights</div>
+                <div className="grid grid-cols-2 gap-3">
+                  {Object.entries(metricWeights).map(([k, v]) => (
+                    <div key={k} className="grid grid-cols-3 items-center gap-2">
+                      <label className="capitalize">{k.replaceAll("_", " ")}</label>
+                      <div className="col-span-2 px-2">
+                        <input
+                          type="range"
+                          min={0}
+                          max={3}
+                          step={0.1}
+                          value={v}
+                          onChange={(e) => setMetricWeights(prev => ({ ...prev, [k]: Number(e.target.value) }))}
+                          className="w-full"
+                        />
+                        <div className="text-sm text-slate-500">{v.toFixed(1)}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {error && (
+              <div className="bg-red-50 text-red-700 border border-red-200 p-3 rounded-xl mb-4 text-sm">
+                {error}
+              </div>
+            )}
+
+            <div className="grid md:grid-cols-2 gap-4">
+              <div>
+                <div className="p-4 sm:p-6 border rounded-xl">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="font-semibold">
+                      Predictions
+                    </div>
+                    <div className="text-xs text-slate-500">2025, Week {week}</div>
+                  </div>
+                  <div className="space-y-3">
+                    {loading && <div className="text-sm text-slate-500">Crunching numbers…</div>}
+                    {!loading && preds.length === 0 && (
+                      <div className="text-sm text-slate-500">No games found for week {week}.</div>
+                    )}
+                    <ul className="space-y-2">
+                      {preds.map((p) => (
+                        <li key={p.game_id} className="p-3 rounded-2xl border shadow-sm bg-white">
+                          <div className="flex items-center justify-between">
+                            <div className="font-semibold">{p.away} @ {p.home}</div>
+                            <div className="text-xs text-slate-500">{p.date || ""}</div>
+                          </div>
+                          <div className="mt-2 grid grid-cols-4 gap-2 text-sm">
+                            <div>
+                              <div className="text-slate-500">Home win %</div>
+                              <div className="font-bold">{(p.home_win_prob * 100).toFixed(1)}%</div>
+                            </div>
+                            <div>
+                              <div className="text-slate-500">Point Spread</div>
+                              <div className="font-bold">{p.point_spread} (Home)</div>
+                            </div>
+                            <div>
+                              <div className="text-slate-500">Edge</div>
+                              <div className="font-bold">{p.edge.toFixed(2)}</div>
+                            </div>
+                            <div className="text-right">
+                              <div className="text-slate-500">Ratings (H/A)</div>
+                              <div className="font-bold">{p.home_rating?.toFixed(2)} / {p.away_rating?.toFixed(2)}</div>
+                            </div>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+                {!loading && preds.length > 0 && (
+                  <div className="mt-4 p-4 border rounded-xl">
+                    <div className="font-semibold mb-3">Win Probability Chart</div>
+                    <canvas ref={chartRef} className="w-full h-48"></canvas>
+                  </div>
+                )}
+              </div>
+
+              <div className="p-4 sm:p-6 border rounded-xl">
+                <div className="font-semibold mb-3">Raw Team-Week Rows (Debug)</div>
+                <div className="text-xs text-slate-500 mb-2">Showing up to 25 recent rows.</div>
+                <div className="overflow-auto max-h-[480px] rounded-2xl border">
+                  <table className="w-full text-xs">
+                    <thead className="bg-slate-50">
+                      <tr>
+                        <th className="text-left p-2">Team</th>
+                        <th className="text-left p-2">Season</th>
+                        <th className="text-left p-2">Week</th>
+                        <th className="text-left p-2">Points</th>
+                        <th className="text-left p-2">Opp Pts</th>
+                        <th className="text-left p-2">Off EPA/Play</th>
+                        <th className="text-left p-2">Def EPA/Play</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rawTeamWeeks.slice(-25).map((r, idx) => (
+                        <tr key={idx} className="odd:bg-white even:bg-slate-50/60">
+                          <td className="p-2">{r.team}</td>
+                          <td className="p-2">{r.season}</td>
+                          <td className="p-2">{r.week}</td>
+                          <td className="p-2">{pick(r, ["points", "points_for", "pf", "points_scored"]) ?? ""}</td>
+                          <td className="p-2">{pick(r, ["points_against", "points_allowed", "pa"]) ?? ""}</td>
+                          <td className="p-2">{pick(r, ["off_epa_per_play", "off_epa"]) ?? ""}</td>
+                          <td className="p-2">{pick(r, ["def_epa_per_play", "def_epa"]) ?? ""}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <footer className="mt-8 text-xs text-slate-500 leading-relaxed">
+              Data via nflverse (<a className="underline" href="https://nflreadr.nflverse.com/" target="_blank" rel="noreferrer">nflreadr</a>).
+              <br />
+              Improvements: Exponential weighting for recent games, configurable regression/decay/spread scale, enhanced column picking, fixed syntax/chart rendering.
+            </footer>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(React.createElement(App));
+  </script>
+</body>
+</html>
